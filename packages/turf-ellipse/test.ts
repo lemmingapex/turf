@@ -759,26 +759,35 @@ test("turf-ellipse -- elongated ellipses do not self-intersect", (t) => {
   t.end();
 });
 
+/**
+ * Undo ellipse()'s mapping: each vertex was placed with
+ * destination(center, r, 90 - φ + angle), so recover r (in meters) and φ to
+ * get the planar (x, y) the vertex was constructed at.
+ */
+function planarFromLonLat(
+  center: number[],
+  p: Position,
+  angle: number
+): number[] {
+  const r = distance(center, p, { units: "meters" });
+  const [lon1, lat1, lon2, lat2] = [center[0], center[1], p[0], p[1]].map(
+    (deg) => (deg * Math.PI) / 180
+  );
+  const bearing = Math.atan2(
+    Math.sin(lon2 - lon1) * Math.cos(lat2),
+    Math.cos(lat1) * Math.sin(lat2) -
+      Math.sin(lat1) * Math.cos(lat2) * Math.cos(lon2 - lon1)
+  );
+  const phi = Math.PI / 2 - bearing + (angle * Math.PI) / 180;
+  return [r * Math.cos(phi), r * Math.sin(phi)];
+}
+
 test("turf-ellipse -- inscribed vertices lie on, and circumscribed edges are tangent to, the ellipse", (t) => {
   const center = [0, 60];
   const tolerance = 0.001; // meters
 
-  // Undo ellipse()'s mapping: each vertex was placed with
-  // destination(center, r, 90 - φ + angle), so recover r and φ to get the
-  // planar (x, y) the vertex was constructed at.
-  const toPlanar = (p: Position, angle: number) => {
-    const r = distance(center, p, { units: "meters" });
-    const [lon1, lat1, lon2, lat2] = [center[0], center[1], p[0], p[1]].map(
-      (deg) => (deg * Math.PI) / 180
-    );
-    const bearing = Math.atan2(
-      Math.sin(lon2 - lon1) * Math.cos(lat2),
-      Math.cos(lat1) * Math.sin(lat2) -
-        Math.sin(lat1) * Math.cos(lat2) * Math.cos(lon2 - lon1)
-    );
-    const phi = Math.PI / 2 - bearing + (angle * Math.PI) / 180;
-    return [r * Math.cos(phi), r * Math.sin(phi)];
-  };
+  const toPlanar = (p: Position, angle: number) =>
+    planarFromLonLat(center, p, angle);
 
   const axes: [number, number][] = [
     [2000, 1000],
@@ -1044,6 +1053,362 @@ test("turf-ellipse -- pivot", (t) => {
     t.true(
       distance(pivoted.geometry.coordinates[0][0], point(center)) > 10,
       `${method}: pivoting moves the ellipse away from its original center`
+    );
+  });
+
+  t.end();
+});
+
+function distanceToSegment(p: number[], u: number[], v: number[]): number {
+  const dx = v[0] - u[0];
+  const dy = v[1] - u[1];
+  const s = Math.max(
+    0,
+    Math.min(1, ((p[0] - u[0]) * dx + (p[1] - u[1]) * dy) / (dx * dx + dy * dy))
+  );
+  return Math.hypot(p[0] - u[0] - s * dx, p[1] - u[1] - s * dy);
+}
+
+/**
+ * Exact distance from point (x, y) to the ellipse x²/a² + y²/b² = 1, by David
+ * Eberly's robust bisection ("Distance from a Point to an Ellipse, an
+ * Ellipsoid, or a Hyperellipsoid").
+ */
+function distanceToEllipse(a: number, b: number, x: number, y: number) {
+  // work in the first quadrant, with the larger semi-axis first
+  let [e0, e1, y0, y1] = [a, b, Math.abs(x), Math.abs(y)];
+  if (e0 < e1) [e0, e1, y0, y1] = [e1, e0, y1, y0];
+  if (y1 > 0) {
+    if (y0 > 0) {
+      const z0 = y0 / e0;
+      const z1 = y1 / e1;
+      let g = z0 * z0 + z1 * z1 - 1;
+      if (g === 0) return 0;
+      const r0 = (e0 / e1) * (e0 / e1);
+      const n0 = r0 * z0;
+      let s0 = z1 - 1;
+      let s1 = g < 0 ? 0 : Math.hypot(n0, z1) - 1;
+      let s = 0;
+      for (let i = 0; i < 2000; i++) {
+        s = (s0 + s1) / 2;
+        if (s === s0 || s === s1) break;
+        const ratio0 = n0 / (s + r0);
+        const ratio1 = z1 / (s + 1);
+        g = ratio0 * ratio0 + ratio1 * ratio1 - 1;
+        if (g > 0) s0 = s;
+        else if (g < 0) s1 = s;
+        else break;
+      }
+      const x0 = (r0 * y0) / (s + r0);
+      const x1 = y1 / (s + 1);
+      return Math.hypot(x0 - y0, x1 - y1);
+    }
+    return Math.abs(y1 - e1);
+  }
+  const numer0 = e0 * y0;
+  const denom0 = e0 * e0 - e1 * e1;
+  if (numer0 < denom0) {
+    const xde0 = numer0 / denom0;
+    return Math.hypot(e0 * xde0 - y0, e1 * Math.sqrt(1 - xde0 * xde0));
+  }
+  return Math.abs(y0 - e0);
+}
+
+/**
+ * Brute-force Hausdorff distance, in meters, between an ellipse() polygon and
+ * the true ellipse with semi-axes a and b (meters), measured in the plane the
+ * polygon was built in: the farthest any point of either gets from the other.
+ */
+function hausdorffToEllipse(
+  center: number[],
+  ring: Position[],
+  a: number,
+  b: number,
+  angle: number
+): number {
+  const polygon = ring
+    .slice(0, -1)
+    .map((p) => planarFromLonLat(center, p, angle));
+  const n = polygon.length;
+  let worst = 0;
+
+  // polygon to ellipse: points along every edge, measured exactly
+  const pointsPerEdge = 16;
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = polygon[i];
+    const [x2, y2] = polygon[(i + 1) % n];
+    for (let k = 0; k < pointsPerEdge; k++) {
+      const f = k / pointsPerEdge;
+      worst = Math.max(
+        worst,
+        distanceToEllipse(a, b, x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)
+      );
+    }
+  }
+
+  // ellipse to polygon: 40000 points around the ellipse, each compared with
+  // the polygon's edges near the same parametric angle (the polygon winds
+  // once around the center, so these are in order), which is where its
+  // nearest point on the polygon lies
+  const vertexParams = polygon.map(([x, y]) => Math.atan2(y / b, x / a));
+  const byParam = vertexParams
+    .map((u, i) => [u, i])
+    .sort((p, q) => p[0] - q[0]);
+  const window = Math.min(5, n);
+  const samples = 40000;
+  for (let j = 0; j < samples; j++) {
+    const t = -Math.PI + (2 * Math.PI * j) / samples;
+    const p = [a * Math.cos(t), b * Math.sin(t)];
+    let lo = 0;
+    let hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (byParam[mid][0] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    const nearest = byParam[lo % n][1];
+    let best = Infinity;
+    for (let d = -window; d <= window; d++) {
+      const i = (((nearest + d) % n) + n) % n;
+      best = Math.min(
+        best,
+        distanceToSegment(p, polygon[i], polygon[(i + 1) % n])
+      );
+    }
+    worst = Math.max(worst, best);
+  }
+  return worst;
+}
+
+test("turf-ellipse -- arcTolerance keeps the polygon within tolerance of the ellipse", (t) => {
+  const center = [0, 60];
+  // a circle, moderate ellipses, and elongated ones where the error is
+  // concentrated at the sharp ends of the major axis
+  const axes: [number, number][] = [
+    [2000, 2000],
+    [2000, 1500],
+    [2000, 1000],
+    [1000, 2000],
+    [2000, 400],
+    [5000, 200],
+  ];
+  // from much finer than the ellipse's sharpest curve to much coarser
+  const tolerances = [0.5, 5, 50];
+  // the measurement recovers planar coordinates through distance() and a
+  // bearing, which is good to about a millimeter at these sizes
+  const slack = 0.002;
+
+  axes.forEach(([a, b]) => {
+    tolerances.forEach((arcTolerance) => {
+      allMethods.forEach((method) => {
+        const angle = 30;
+        const label = `${a}x${b} m, arcTolerance ${arcTolerance} m, ${method}`;
+        const ring = ellipse(center, a, b, {
+          arcTolerance,
+          method,
+          angle,
+          units: "meters",
+        }).geometry.coordinates[0];
+        const steps = ring.length - 1;
+        const error = hausdorffToEllipse(center, ring, a, b, angle);
+        t.true(
+          error <= arcTolerance + slack,
+          `${label}: ${steps} steps stay within tolerance (error ${error.toFixed(3)} m)`
+        );
+
+        // Not wastefully many steps. The error does not shrink steadily with
+        // every added step, but it does within each residue mod 4 (see
+        // stepsForArcTolerance), so if the largest smaller count of each
+        // residue misses the tolerance, every smaller count does.
+        for (let fewer = steps - 1; fewer >= Math.max(3, steps - 4); fewer--) {
+          const fewerRing = ellipse(center, a, b, {
+            steps: fewer,
+            method,
+            angle,
+            units: "meters",
+          }).geometry.coordinates[0];
+          const fewerError = hausdorffToEllipse(center, fewerRing, a, b, angle);
+          t.true(
+            fewerError > arcTolerance,
+            `${label}: ${fewer} steps would not be enough (error ${fewerError.toFixed(3)} m)`
+          );
+        }
+      });
+    });
+  });
+
+  t.end();
+});
+
+test("turf-ellipse -- coarse arcTolerance on elongated ellipses", (t) => {
+  // When arcTolerance is comparable to the ellipse's width, a few long edges
+  // suffice, and the ellipse's sharp end can poke out past a vertex rather
+  // than an edge. Measuring only how far the ellipse bulges past each edge
+  // missed that, and accepted a 3-step triangle 1476 m from a 4447 x 345.5 m
+  // ellipse for an arcTolerance of 829 m.
+  const center = [0, 60];
+  const cases: [number, number, number][] = [
+    [4447.3, 345.5, 829.385],
+    [928.9, 83.5, 172.109],
+    [2807, 94.6, 91.685],
+    [4483.1, 148, 123.649],
+    [1848.6, 119.4, 360.595],
+  ];
+  const slack = 0.002;
+
+  cases.forEach(([a, b, arcTolerance]) => {
+    [0, 30].forEach((angle) => {
+      allMethods.forEach((method) => {
+        [
+          [a, b],
+          [b, a],
+        ].forEach(([x, y]) => {
+          const ring = ellipse(center, x, y, {
+            arcTolerance,
+            method,
+            angle,
+            units: "meters",
+          }).geometry.coordinates[0];
+          const error = hausdorffToEllipse(center, ring, x, y, angle);
+          t.true(
+            error <= arcTolerance + slack,
+            `${x}x${y} m, arcTolerance ${arcTolerance} m, angle ${angle}, ${method}: ${ring.length - 1} steps stay within tolerance (error ${error.toFixed(3)} m)`
+          );
+        });
+      });
+    });
+  });
+
+  t.end();
+});
+
+test("turf-ellipse -- arcTolerance on a degenerate ellipse matches circle", (t) => {
+  const centers = [
+    [-105, 40],
+    [0, 60],
+  ];
+  const radii = [1, 1000, 12345.6789];
+  const relativeTolerances = [1e-6, 1e-4, 3.3e-3, 0.02, 0.15];
+
+  centers.forEach((center) => {
+    radii.forEach((radius) => {
+      relativeTolerances.forEach((relative) => {
+        const arcTolerance = radius * relative;
+        const label = `center=${center}, radius=${radius}, arcTolerance=${arcTolerance}`;
+        (["inscribed", "circumscribed"] as const).forEach((method) => {
+          const e = ellipse(center, radius, radius, { arcTolerance, method })
+            .geometry.coordinates[0];
+          const c = circle(center, radius, { arcTolerance, method }).geometry
+            .coordinates[0];
+          const maxDiff =
+            e.length === c.length
+              ? Math.max(
+                  ...normalizeLon([e])[0].map((v, i) => {
+                    const w = normalizeLon([c])[0][i];
+                    return Math.max(
+                      Math.abs(v[0] - w[0]),
+                      Math.abs(v[1] - w[1])
+                    );
+                  })
+                )
+              : Infinity;
+          t.true(
+            maxDiff < 1e-9,
+            `${method}, ${label}: same ${c.length - 1} steps and vertices as circle (ellipse has ${e.length - 1})`
+          );
+        });
+
+        // turf-circle picks its equalarea step count from a Taylor-series
+        // estimate that is sometimes one step more than needed; ellipse
+        // measures the error, so it may use that one step fewer.
+        const e = ellipse(center, radius, radius, {
+          arcTolerance,
+          method: "equalarea",
+        }).geometry.coordinates[0];
+        const c = circle(center, radius, {
+          arcTolerance,
+          method: "equalarea",
+        }).geometry.coordinates[0];
+        t.true(
+          e.length === c.length || e.length === c.length - 1,
+          `equalarea, ${label}: ${e.length - 1} steps vs circle's ${c.length - 1}`
+        );
+      });
+    });
+  });
+
+  t.end();
+});
+
+test("turf-ellipse -- arcTolerance overrides steps and scales with the tolerance", (t) => {
+  const center = [0, 60];
+
+  allMethods.forEach((method) => {
+    const stepsFor = (arcTolerance: number, a = 2000, b = 1000) =>
+      ellipse(center, a, b, { arcTolerance, method, units: "meters" }).geometry
+        .coordinates[0].length - 1;
+
+    t.deepEqual(
+      ellipse(center, 2000, 1000, {
+        arcTolerance: 1,
+        steps: 7,
+        method,
+        units: "meters",
+      }),
+      ellipse(center, 2000, 1000, { arcTolerance: 1, method, units: "meters" }),
+      `${method}: steps is ignored when arcTolerance is given`
+    );
+
+    t.true(
+      stepsFor(0.1) > stepsFor(1) && stepsFor(1) > stepsFor(10),
+      `${method}: a smaller arcTolerance gives more steps`
+    );
+    t.true(
+      stepsFor(1, 2000, 200) > stepsFor(1, 2000, 1000),
+      `${method}: a more elongated ellipse needs more steps for the same arcTolerance`
+    );
+    t.equal(
+      stepsFor(1e6),
+      3,
+      `${method}: an arcTolerance larger than the ellipse gives a triangle`
+    );
+    t.equal(
+      ellipse(center, 2, 1, {
+        arcTolerance: 0.001,
+        method,
+        units: "kilometers",
+      }).geometry.coordinates[0].length - 1,
+      stepsFor(1),
+      `${method}: arcTolerance is in the same units as the semi-axes`
+    );
+  });
+
+  t.end();
+});
+
+test("turf-ellipse -- invalid arcTolerance throws instead of being ignored", (t) => {
+  const center = [0, 60];
+
+  [-0.01, 0, NaN, "0.01" as any].forEach((arcTolerance) => {
+    allMethods.forEach((method) => {
+      t.throws(
+        () => ellipse(center, 10, 5, { arcTolerance, method }),
+        /arcTolerance must be positive/,
+        `${method}: arcTolerance = ${JSON.stringify(arcTolerance)} throws`
+      );
+    });
+  });
+  t.equal(
+    ellipse(center, 10, 5, { arcTolerance: undefined }).geometry.coordinates[0]
+      .length,
+    64 + 1,
+    "undefined arcTolerance falls back to the default steps"
+  );
+  allMethods.forEach((method) => {
+    t.throws(
+      () => ellipse(center, 6000, 3000, { arcTolerance: 1e-9, method }),
+      /too small for an ellipse with semi-axes 6000 and 3000/,
+      `${method}: an arcTolerance needing more than 20000 steps throws instead of hanging`
     );
   });
 
